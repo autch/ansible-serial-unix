@@ -24,6 +24,7 @@ DOCUMENTATION = '''
         default: inventory_hostname
         vars:
           - name: ansible_host
+          - name: inventory_hostname
       serial_port:
         description: Serial port to connect to
         default: /dev/ttyS0
