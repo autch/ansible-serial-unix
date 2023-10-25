@@ -57,6 +57,30 @@ DOCUMENTATION = '''
           - name: ANSIBLE_REMOTE_USER
         vars:
           - name: ansible_user
+      rtscts:
+        description:
+          - Enable hardware flow control (RTS/CTS)
+        default: true
+        ini:
+          - section: defaults
+            key: rtscts
+        env:
+          - name: ANSIBLE_SERIAL_RTSCTS
+        vars:
+          - name: ansible_serial_rtscts
+        type: bool
+      dsrdtr:
+        description:
+          - Enable hardware flow control (DSR/DTR)
+        default: false
+        ini:
+          - section: defaults
+            key: dsrdtr
+        env:
+          - name: ANSIBLE_SERIAL_DSRDTR
+        vars:
+          - name: ansible_serial_dsrdtr
+        type: bool
 '''
 import base64
 import dataclasses
@@ -128,8 +152,12 @@ class Connection(ConnectionBase):
             # get serial connection parameters
             self.ser.port = self.get_option('serial_port')
             self.ser.baudrate = self.get_option('baudrate')
+            self.ser.rtscts = self.get_option('rtscts')
+            self.ser.dsrdtr = self.get_option('dsrdtr')
             self.payload_size = int(self.get_option('payload_size'))
             self.ser.timeout = 0
+
+            self.loop_interval = round((self.payload_size * 10) / self.ser.baudrate, ndigits=2)
 
             # initiate serial connection
             self.ser.open()
@@ -273,17 +301,19 @@ class Connection(ConnectionBase):
     def write(self):
         ''' write from the write queue to the serial connection '''
         while not self.stop_event.wait(self.loop_interval):
-            if self.q['write'].qsize() > 0:
-                qm = self.q['write'].get()
+            try:
+                qm = self.q['write'].get(block=True, timeout=self.loop_interval)
+            except queue.Empty:
+                continue
 
-                display.vvvv('>>>> {0}'.format(repr(qm.data)))
-                bm = qm.data if type(qm.data) is bytes else bytes(qm.data, 'utf-8')
+            display.vvvv('>>>> {0}'.format(repr(qm.data)))
+            bm = qm.data if type(qm.data) is bytes else bytes(qm.data, 'utf-8')
 
-                # split in smaller payloads
-                p_size = self.payload_size
-                #payloads = [bm[i:i+p_size] for i in range(0, len(bm), p_size)]
-                #for p in payloads:
-                self.ser.write(bm)
+            # split in smaller payloads
+            p_size = self.payload_size
+            #payloads = [bm[i:i+p_size] for i in range(0, len(bm), p_size)]
+            #for p in payloads:
+            self.ser.write(bm)
 
     def decoder(self):
         ''' b64 decoder with remainder for unbounded messages '''
@@ -308,29 +338,29 @@ class Connection(ConnectionBase):
     def read_q_until(self, break_condition, inclusive=False):
         ''' read the queue until a specified condition '''
         q = self.q['read']
-        t_start = time.time()
-        timeout = self.read_timeout
+        line = bytearray()
         while True:
-            if q.qsize() > 0:
-                # get the next message
-                m = q.get()
+            try:
+                m = q.get(block=True, timeout=self.read_timeout)
 
                 # yield the message and break the loop if needed
                 if inclusive: yield m
-                if break_condition(m):
-                    break
+
+                line.extend(m)
+                lines = line.splitlines()
+                for l in lines:
+                    if break_condition(l):
+                        return
                 if not inclusive: yield m
 
-                # after receiving any message, reset the timeout
-                t_start = time.time()
-            else:
-                time.sleep(self.loop_interval)
-                if time.time() >= t_start + timeout:
-                    raise LookupError(
-                        'break_condition "{fn}" has not been met for {t} seconds'.format(
-                            fn=repr(break_condition),
-                            t=timeout
-                    ))
+                lines = [i for i in lines if b"\n" not in i]
+                line = lines[-1] if lines else bytearray()
+            except queue.Empty:
+                raise LookupError(
+                    'break_condition "{fn}" has not been met for {t} seconds'.format(
+                        fn=repr(break_condition),
+                        t=self.read_timeout
+                ))
 
     def is_prompt_line(self, m):
         return m.startswith(self.ps1)
@@ -338,12 +368,12 @@ class Connection(ConnectionBase):
     def is_line(self, line):
         ''' compare a message with a specified line '''
         def c(m):
-            if type(m) is bytes:
+            if type(m) is bytes or type(m) is bytearray:
                 try:
                     m = m.decode()
                 except(UnicodeDecodeError, AttributeError):
                     return False
-            return m.rstrip() == line.rstrip()
+            return m.rstrip().endswith(line.rstrip())
         return c
 
     def is_any_prompt(self, m):
@@ -375,7 +405,7 @@ class Connection(ConnectionBase):
     def req_shell_type(self):
         ''' make a request and return the shell type '''
         # send line-feed character
-        ctrl_j = chr(10)
+        ctrl_j = chr(10).encode('ascii')
         self.q['write'].put(Message(ctrl_j))
 
         # wait until a prompt is found
@@ -413,7 +443,7 @@ class Connection(ConnectionBase):
         elif re.search('^Password: $', clean_line):
             return 'password'
 
-        elif re.search('(\$|#) $', clean_line):
+        elif re.search('($|#) $', re.sub('\r?\n$', '', clean_line)):
             self.ps1 = bytes(line.decode().rstrip('\n'), 'utf-8')
             return 'shell'
 
@@ -437,7 +467,7 @@ class Connection(ConnectionBase):
 
 
     def logout(self):
-        ctrl_d = chr(4)
+        ctrl_d = chr(4).encode('ascii')
         self.q['write'].put(Message(ctrl_d))
 
         if self.req_shell_type() == 'login':
