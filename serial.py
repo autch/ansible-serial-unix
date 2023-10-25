@@ -82,6 +82,19 @@ DOCUMENTATION = '''
         vars:
           - name: ansible_serial_dsrdtr
         type: bool
+      use_gzip:
+        description:
+          - Use gzip to compress payload for transfer
+        default: true
+        ini:
+          - section: defaults
+            key: use_gzip
+        env:
+          - name: ANSIBLE_SERIAL_USE_GZIP
+        vars:
+          - name: ansible_serial_use_gzip
+        type: bool
+
 '''
 import base64
 import dataclasses
@@ -90,6 +103,10 @@ import queue
 import re
 import serial
 import threading
+import gzip
+import shutil
+import secrets
+import textwrap
 import time
 
 import ansible.constants as C
@@ -156,6 +173,7 @@ class Connection(ConnectionBase):
             self.ser.rtscts = self.get_option('rtscts')
             self.ser.dsrdtr = self.get_option('dsrdtr')
             self.payload_size = int(self.get_option('payload_size'))
+            self.use_gzip = self.get_option('use_gzip')
             self.ser.timeout = 0
 
             self.loop_interval = round((self.payload_size * 10) / self.ser.baudrate, ndigits=2)
@@ -234,6 +252,55 @@ class Connection(ConnectionBase):
         # TODO (in|out)_path sanitization (if not done already)
         display.vvv(u"PUT {0} TO {1}".format(in_path, out_path), host=self.host)
 
+        # marker = "__ANSIBLE_SERIAL_PUT_{}__".format(secrets.token_hex(32))
+        # self.q['write'].put(Message("cat <<'{marker}' | base64 -d | gzip -dc > {path}\n".format(marker=marker, path=out_path)))
+        if self.use_gzip:
+            self.q['write'].put(Message("cat | base64 -d | gzip -dc > {path}\n".format(path=out_path)))
+        else:
+            self.q['write'].put(Message("cat | base64 -d > {path}\n".format(path=out_path)))
+
+        if self.use_gzip:
+            zipf = io.BytesIO()
+            with open(in_path, 'rb') as f, \
+                gzip.GzipFile(filename=in_path, fileobj=zipf, mode='wb') as zf:
+                shutil.copyfileobj(f, zf)
+            zipf.seek(0)
+
+            # split the file in payloads of < 512 bytes
+            while (b := zipf.read(1024)):
+                # contruct the command and send it
+                for l in textwrap.wrap(base64.b64encode(b).decode('ascii'), 1024):
+                    cmd = Message(l + "\n")
+                    self.q['write'].put(cmd)
+        else:
+            with open(in_path, 'rb') as f:
+                # split the file in payloads of < 512 bytes
+                while (b := f.read(1024)):
+                    # contruct the command and send it
+                    for l in textwrap.wrap(base64.b64encode(b).decode('ascii'), 1024):
+                        cmd = Message(l + "\n")
+                        self.q['write'].put(cmd)
+
+        # send end delimiter
+        # self.q['write'].put(Message(marker + "\n"))
+        ctrl_d = chr(4).encode('ascii')
+        self.q['write'].put(Message(ctrl_d))
+
+        while not self.q['write'].empty():
+            time.sleep(self.loop_interval)
+
+        list(self.read_q_until(self.is_any_prompt, inclusive=True))
+
+
+    # older method, may be safer than current one
+    def _put_file(self, in_path, out_path):
+        ''' transfer a file from local to remote '''
+
+        super(Connection, self).put_file(in_path, out_path)
+
+        # TODO (in|out)_path sanitization (if not done already)
+        display.vvv(u"PUT {0} TO {1}".format(in_path, out_path), host=self.host)
+
         # cmd for every payload
         #cmd_pre = bytes('head -c -1 >> \'{}\' <<\'<<eof>>\'\n'.format(out_path), 'utf-8')
         #cmd_post = bytes('\n<<eof>>\n', 'utf-8')
@@ -241,24 +308,45 @@ class Connection(ConnectionBase):
         # TODO truly calculate max pyload size
 
         cmd_pre = bytes('echo -n \'', 'utf-8')
-        cmd_post = bytes('\' | base64 -d >> {}\n'.format(out_path), 'utf-8')
+        if self.use_gzip:
+            cmd_post = bytes('\' | base64 -d >> \'{}\'\n'.format(out_path + '.gz'), 'utf-8')
+        else:
+            cmd_post = bytes('\' | base64 -d >> \'{}\'\n'.format(out_path), 'utf-8')
 
         # send start delimiter
         # TODO add variable to lessen the length of $out_path
         self.q['write'].put(Message('echo "<<--START-TR-->>"\n'))
 
-        with open(in_path, 'rb') as f:
+        if self.use_gzip:
+            zipf = io.BytesIO()
+
+            with open(in_path, 'rb') as f, \
+                gzip.GzipFile(filename=in_path, fileobj=zipf, mode='wb') as zf:
+                shutil.copyfileobj(f, zf)
+
+            zipf.seek(0)
+
             # split the file in payloads of < 512 bytes
-            while (b := f.read(510)):
+            while (b := zipf.read(510)):
                 # contruct the command and send it
                 cmd = Message(cmd_pre + base64.b64encode(b) + cmd_post)
                 self.q['write'].put(cmd)
+        else:
+            with open(in_path, 'rb') as f:
+                # split the file in payloads of < 512 bytes
+                while (b := f.read(510)):
+                    # contruct the command and send it
+                    cmd = Message(cmd_pre + base64.b64encode(b) + cmd_post)
+                    self.q['write'].put(cmd)
 
         # send end delimiter
         self.q['write'].put(Message('echo "<<--END-TR-->>"\n'))
 
         list(self.read_q_until(self.is_line("<<--START-TR-->>"), inclusive=True))
         list(self.read_q_until(self.is_line("<<--END-TR-->>"), inclusive=False))
+
+        if self.use_gzip:
+            self.q['write'].put(Message("gzip -d '{gz}'; rm -f '{gz}'".format(gz=out_path + '.gz')))
 
     def fetch_file(self, in_path, out_path):
         ''' copy a file from remote to local '''
@@ -270,14 +358,32 @@ class Connection(ConnectionBase):
         # file in reveived in base64
         #best option: (requires coreutils on remote machine)
         #cmd = 'split -b 512 --filter "base64" "{0}"'.format(in_path)
-        cmd = 'base64 {0}'.format(in_path)
+        if self.use_gzip:
+            cmd = "gzip -9c '{0}' | base64 -w1024".format(in_path)
+        else:
+            cmd = "base64 '{0}'".format(in_path)
 
-        # receive the decoded base64 splited file
-        with open(out_path, 'wb') as f:
+        if self.use_gzip:
+            gzio = io.BytesIO()
+
             decode = self.decoder()
             for b in self.low_cmd(cmd, 'fetch'):
                 d = decode(b.rstrip())
-                f.write(d)
+                gzio.write(d)
+
+            gzio.seek(0)
+
+            with gzip.open(gzio, 'rb') as gz, \
+                open(out_path, 'wb') as f:
+                shutil.copyfileobj(gz, f)
+
+        else:
+            # receive the decoded base64 splited file
+            with open(out_path, 'wb') as f:
+                decode = self.decoder()
+                for b in self.low_cmd(cmd, 'fetch'):
+                    d = decode(b.rstrip())
+                    f.write(d)
 
     def close(self):
         display.debug("in close")
