@@ -178,6 +178,9 @@ class Connection(ConnectionBase):
         if  shell_type == 'login':
             self.login()
 
+        self.q['write'].put(Message("stty -echo\n"))
+        self.q['write'].put(Message("set +o history\n"))
+
         return self
 
     def exec_command(self, cmd, in_data=None, sudoable=True):
@@ -468,6 +471,9 @@ class Connection(ConnectionBase):
 
 
     def logout(self):
+        self.q['write'].put(Message("stty echo\n"))
+        self.q['write'].put(Message("set -o history\n"))
+
         ctrl_d = chr(4).encode('ascii')
         self.q['write'].put(Message(ctrl_d))
 
